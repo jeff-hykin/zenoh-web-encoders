@@ -20,7 +20,7 @@ videotoolbox = []
 gstreamer = ["dep:libloading"]
 
 [dependencies]
-zenoh-web = { version = "0.4.0", git = "https://github.com/jeff-hykin/zenoh-web", rev = "58d5394024674117c2a4faab93d472299a54ef9b" }
+zenoh-web = { version = "0.4.0", git = "https://github.com/jeff-hykin/zenoh-web", rev = "fb465e704544008095a00b5416d68b6abc91147c" }
 anyhow = "1"
 log = "0.4"
 libloading = { version = "0.9", optional = true }
