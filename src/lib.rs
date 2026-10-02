@@ -1,0 +1,245 @@
+//! Hardware video encoders for [zenoh-web](https://github.com/jeff-hykin/zenoh-web), as [`VideoEncoder`]s for
+//! [`ServerBuilder::video_encoder`](zenoh_web::ServerBuilder::video_encoder):
+//! - `videotoolbox` (feature): macOS VideoToolbox, the Mac's media engine;
+//! - `gstreamer` (feature): a GStreamer hardware encoder found at runtime, `nvv4l2h264enc` (Jetson), `nvh264enc`
+//!   (NVENC) or `vah264enc` / `vaapih264enc` (VAAPI).
+//!
+//! [`select`] probes them (each must encode a test frame) and wraps the one it picks in a [`Fallback`] to software
+//! H.264, so a hardware encoder that fails mid-stream hands over to openh264 from a keyframe.
+//!
+//! ```no_run
+//! # async fn run() -> anyhow::Result<()> {
+//! let selected = zenoh_web_encoders::select(zenoh_web_encoders::Backend::Auto)?;
+//! let mut builder = zenoh_web::Server::builder();
+//! if let Some(factory) = selected.factory {
+//!     builder = builder.video_encoder(factory);
+//! }
+//! println!("video encoder: {}", selected.name);
+//! # Ok(())
+//! # }
+//! ```
+
+#[cfg(feature = "gstreamer")]
+pub mod gstreamer;
+#[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+pub mod videotoolbox;
+
+use anyhow::{Result, bail};
+use std::str::FromStr;
+use zenoh_web::{DecodedFrame, EncodedVideo, H264Encoder, VideoEncoder, VideoFormat, VideoTarget};
+
+/// Which encoder to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// The first hardware one that works (VideoToolbox, then GStreamer), else software.
+    Auto,
+    /// openh264 (zenoh-web's own).
+    Software,
+    /// macOS VideoToolbox.
+    VideoToolbox,
+    /// A GStreamer hardware encoder.
+    Gstreamer,
+}
+
+impl FromStr for Backend {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, String> {
+        Ok(match name {
+            "auto" => Backend::Auto,
+            "software" => Backend::Software,
+            "videotoolbox" => Backend::VideoToolbox,
+            "gstreamer" => Backend::Gstreamer,
+            _ => return Err(format!("unknown video encoder {name:?} (auto, software, videotoolbox, gstreamer)")),
+        })
+    }
+}
+
+/// Makes an encoder per encode session.
+pub type Factory = Box<dyn Fn() -> Box<dyn VideoEncoder> + Send + Sync>;
+
+/// What [`select`] picked.
+pub struct Selected {
+    /// e.g. `"videotoolbox"`, `"gstreamer nvv4l2h264enc"`, `"software"`
+    pub name: String,
+    /// `None` for software: zenoh-web's default.
+    pub factory: Option<Factory>,
+}
+
+/// Probes `backend` (with [`Backend::Auto`], each hardware one in turn) by encoding a test frame. An explicitly named
+/// backend that isn't built in or doesn't work is an error; `Auto` falls back to software.
+pub fn select(backend: Backend) -> Result<Selected> {
+    let software = || Selected { name: "software".into(), factory: None };
+    let candidates: &[Backend] = match backend {
+        Backend::Software => return Ok(software()),
+        Backend::Auto => &[Backend::VideoToolbox, Backend::Gstreamer],
+        Backend::VideoToolbox => &[Backend::VideoToolbox],
+        Backend::Gstreamer => &[Backend::Gstreamer],
+    };
+    let mut failures = Vec::new();
+    for candidate in candidates {
+        match probe(*candidate) {
+            Ok(selected) => return Ok(selected),
+            Err(error) => failures.push(format!("{error:#}")),
+        }
+    }
+    if backend == Backend::Auto {
+        log::info!("no hardware video encoder ({}): software H.264", failures.join("; "));
+        return Ok(software());
+    }
+    bail!("{}", failures.join("; "))
+}
+
+fn probe(backend: Backend) -> Result<Selected> {
+    match backend {
+        #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+        Backend::VideoToolbox => {
+            let mut encoder = videotoolbox::VideoToolboxEncoder::default();
+            let image = zenoh_web::VideoImage::i420(320, 240, vec![128; 320 * 240 * 3 / 2])?;
+            encoder.encode(&DecodedFrame::Video(image), &VideoTarget::new(320, 240, 1_000_000, 30.0))?;
+            Ok(Selected { name: "videotoolbox".into(), factory: Some(Box::new(|| Box::new(Fallback::new("videotoolbox", videotoolbox::VideoToolboxEncoder::default())))) })
+        }
+        #[cfg(feature = "gstreamer")]
+        Backend::Gstreamer => {
+            let element = gstreamer::GstreamerEncoder::hardware()?.element();
+            let factory: Factory = Box::new(move || match gstreamer::GstreamerEncoder::with_element(element) {
+                Ok(encoder) => Box::new(Fallback::new(element, encoder)),
+                Err(error) => {
+                    log::warn!("{element}: {error:#}; software H.264 instead");
+                    Box::new(H264Encoder::default())
+                }
+            });
+            Ok(Selected { name: format!("gstreamer {element}"), factory: Some(factory) })
+        }
+        other => bail!("{other:?} is not built in (cargo feature {:?})", format!("{other:?}").to_lowercase()),
+    }
+}
+
+/// A hardware encoder that hands over to software H.264 for good after its first error (from a keyframe).
+pub struct Fallback<E> {
+    name: &'static str,
+    hardware: Option<E>,
+    software: H264Encoder,
+}
+
+impl<E: VideoEncoder> Fallback<E> {
+    /// Wraps `hardware` (an H.264 encoder) called `name` in the logs.
+    pub fn new(name: &'static str, hardware: E) -> Self {
+        Fallback { name, hardware: Some(hardware), software: H264Encoder::default() }
+    }
+}
+
+impl<E: VideoEncoder> VideoEncoder for Fallback<E> {
+    fn format(&self) -> VideoFormat {
+        VideoFormat::H264
+    }
+
+    fn encode(&mut self, frame: &DecodedFrame, target: &VideoTarget) -> Result<Option<EncodedVideo>> {
+        if let Some(hardware) = &mut self.hardware {
+            match hardware.encode(frame, target) {
+                Ok(encoded) => return Ok(encoded),
+                Err(error) => {
+                    log::warn!("{}: {error:#}; software H.264 from here on", self.name);
+                    self.hardware = None;
+                }
+            }
+        }
+        // a new software encoder starts with a keyframe
+        self.software.encode(frame, target)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zenoh_web::VideoImage;
+
+    /// Four solid quadrants: red, green / blue, white.
+    fn quadrants(width: u32, height: u32) -> DecodedFrame {
+        let pixels = (0..height).flat_map(|y| (0..width).flat_map(move |x| match (y < height / 2, x < width / 2) {
+            (true, true) => [255, 0, 0],
+            (true, false) => [0, 255, 0],
+            (false, true) => [0, 0, 255],
+            (false, false) => [255, 255, 255],
+        }));
+        DecodedFrame::Video(VideoImage::rgb8(width, height, pixels.collect()).unwrap())
+    }
+
+    struct Broken;
+
+    impl VideoEncoder for Broken {
+        fn format(&self) -> VideoFormat {
+            VideoFormat::H264
+        }
+
+        fn encode(&mut self, _: &DecodedFrame, _: &VideoTarget) -> Result<Option<EncodedVideo>> {
+            bail!("the device went away")
+        }
+    }
+
+    #[test]
+    fn backends_by_name() {
+        assert_eq!("auto".parse::<Backend>().unwrap(), Backend::Auto);
+        assert_eq!("gstreamer".parse::<Backend>().unwrap(), Backend::Gstreamer);
+        assert!("nvenc".parse::<Backend>().is_err());
+        let software = select(Backend::Software).unwrap();
+        assert!(software.name == "software" && software.factory.is_none());
+    }
+
+    #[test]
+    fn a_failing_encoder_hands_over_to_software_from_a_keyframe() {
+        let mut encoder = Fallback::new("broken", Broken);
+        let target = VideoTarget::new(64, 48, 500_000, 30.0);
+        let first = encoder.encode(&quadrants(64, 48), &target).unwrap().unwrap();
+        assert!(first.keyframe && first.data.starts_with(&[0, 0, 0, 1]));
+        assert!(!encoder.encode(&quadrants(64, 48), &target).unwrap().unwrap().keyframe, "software from then on");
+    }
+
+    /// Decodes Annex B H.264 and returns the RGB pixel at (x, y) of the last picture.
+    #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+    fn decoded_pixel(stream: &[u8], (width, height): (usize, usize), (x, y): (usize, usize)) -> [u8; 3] {
+        use openh264::formats::YUVSource;
+        let mut decoder = openh264::decoder::Decoder::new().unwrap();
+        let mut last = None;
+        for packet in openh264::nal_units(stream) {
+            if let Ok(Some(picture)) = decoder.decode(packet) {
+                assert_eq!(picture.dimensions(), (width, height));
+                let mut rgb = vec![0u8; width * height * 3];
+                picture.write_rgb8(&mut rgb);
+                last = Some(rgb);
+            }
+        }
+        let rgb = last.expect("a decoded picture");
+        let at = (y * width + x) * 3;
+        [rgb[at], rgb[at + 1], rgb[at + 2]]
+    }
+
+    #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+    #[test]
+    fn videotoolbox_encodes_decodable_h264() {
+        let mut encoder = videotoolbox::VideoToolboxEncoder::default();
+        let (frame, mut target) = (quadrants(320, 240), VideoTarget::new(320, 240, 2_000_000, 30.0));
+        let mut stream = Vec::new();
+        let mut keyframes = Vec::new();
+        for index in 0..6 {
+            if index == 3 {
+                target.bitrate_bps = 4_000_000;
+            }
+            target.keyframe = index == 5;
+            let encoded = encoder.encode(&frame, &target).unwrap().expect("one frame out per frame in");
+            assert_eq!((encoded.width, encoded.height), (320, 240));
+            assert!(encoded.data.starts_with(&[0, 0, 0, 1]));
+            keyframes.push(encoded.keyframe);
+            stream.extend(encoded.data);
+        }
+        assert_eq!(keyframes, [true, false, false, false, false, true], "first, then only when asked (a new bitrate applies in place)");
+        let red = decoded_pixel(&stream, (320, 240), (40, 40));
+        assert!(red[0] > 200 && red[1] < 60 && red[2] < 60, "red quadrant decodes red: {red:?}");
+        let white = decoded_pixel(&stream, (320, 240), (280, 200));
+        assert!(white.iter().all(|&channel| channel > 220), "{white:?}");
+        let selected = select(Backend::VideoToolbox).unwrap();
+        assert_eq!(selected.name, "videotoolbox");
+        let encoded = (selected.factory.unwrap())().encode(&frame, &VideoTarget::new(320, 240, 1_000_000, 30.0)).unwrap().unwrap();
+        assert!(encoded.keyframe);
+    }
+}

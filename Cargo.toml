@@ -1,0 +1,30 @@
+[package]
+name = "zenoh-web-encoders"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Hardware video encoders for zenoh-web: macOS VideoToolbox and GStreamer (Jetson nvv4l2h264enc, NVENC, VAAPI), with a fallback to software H.264"
+repository = "https://github.com/jeff-hykin/zenoh-web-encoders"
+license-file = "LICENSE"
+readme = "README.md"
+keywords = ["zenoh", "webrtc", "h264", "videotoolbox", "gstreamer"]
+categories = ["multimedia::video", "hardware-support"]
+include = ["/src/**/*.rs", "/Cargo.toml", "/README.md", "/LICENSE"]
+
+[features]
+default = []
+# macOS VideoToolbox (the media engine); does nothing elsewhere
+videotoolbox = []
+# GStreamer's hardware H.264 encoders, loaded at runtime (dlopen, so building needs no GStreamer): nvv4l2h264enc
+# (Jetson), nvh264enc (NVENC), vah264enc / vaapih264enc (VAAPI)
+gstreamer = ["dep:libloading"]
+
+[dependencies]
+zenoh-web = { version = "0.4.0", git = "https://github.com/jeff-hykin/zenoh-web", rev = "58d5394024674117c2a4faab93d472299a54ef9b" }
+anyhow = "1"
+log = "0.4"
+libloading = { version = "0.9", optional = true }
+
+[dev-dependencies]
+# decodes what the hardware encoders produce
+openh264 = "0.9"
